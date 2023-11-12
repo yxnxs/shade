@@ -1,20 +1,24 @@
 use once_cell::sync::OnceCell;
 use std::{path::Path, sync::RwLock};
 use thiserror::Error;
+use tracing::info;
 
 use xcb::{
     x::{
-        Atom, ChangeProperty, ClearArea, CreateGc, CreatePixmap, Drawable, Gcontext, GetImage,
-        GetProperty, InternAtom, KillClient, Pixmap, PropMode, PutImage, Window, ATOM_NONE,
-        ATOM_PIXMAP,
+        Atom, ChangeProperty, ChangeWindowAttributes, CloseDown::RetainPermanent, CreateGc,
+        CreatePixmap, Cw, Drawable, Gcontext, GetProperty, InternAtom, KillClient,
+        Pixmap, SetCloseDownMode, Window, ATOM_ANY, ATOM_NONE, ATOM_PIXMAP,
     },
-    Connection, Xid, XidNew,
+    Connection, Xid,
 };
 
 #[derive(Error, Debug)]
-pub enum ShadeError {
+pub enum Error {
     #[error("Xorg roots iterator did not provided any screens")]
     NoScreenFound,
+
+    #[error("Failed to resetup screens")]
+    RescreenFailure,
 
     #[error("XCB Interal error: {0}")]
     XCBInteral(#[from] xcb::Error),
@@ -26,7 +30,7 @@ pub enum ShadeError {
     Image(#[from] image::error::ImageError),
 }
 
-pub type Result<T> = std::result::Result<T, ShadeError>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 pub struct BackgroundHandle {
     pub(crate) context: Gcontext,
@@ -52,94 +56,52 @@ pub enum OpenMethod<'a> {
     LoadFromFile(ScalingMethod, &'a dyn AsRef<Path>),
 }
 
-struct Molecule {
-    atom: Atom,
-    pmap: Option<Pixmap>,
-}
-
-fn pixmap_from_atom(connection: &Connection, atom_name: &str, window: Window) -> Result<Molecule> {
-    let cookie = connection.send_request(&InternAtom {
-        name: atom_name.as_bytes(),
-        only_if_exists: true,
-    });
-
-    let atom = connection
-        .wait_for_reply(cookie)
-        .map(|reply| reply.atom())?;
-
-    let property_request = connection.send_request(&GetProperty {
-        window,
-        delete: false,
-        property: atom,
-        r#type: ATOM_PIXMAP,
-        long_offset: 0,
-        long_length: 1,
-    });
-
-    let property_response = connection.wait_for_reply(property_request)?;
-
-    let pmap = if property_response.r#type() == ATOM_NONE {
-        None
+fn resolve_atom(conn: &Connection, window: Window, atom: Atom) -> xcb::Result<Option<u32>> {
+    if atom == ATOM_NONE {
+        return Ok(None);
     } else {
-        Some(unsafe { Pixmap::new(property_response.value()[0]) })
-    };
+        let cookie = conn.send_request(&GetProperty {
+            r#type: ATOM_ANY,
+            delete: false,
+            window,
+            property: atom,
+            long_offset: 0,
+            long_length: 1,
+        });
 
-    Ok(Molecule { atom, pmap })
+        let property = conn.wait_for_reply(cookie)?;
+
+        // TODO Tracing notice
+        // TODO See if this return actually returns or just breaks the function
+        if property.r#type() != ATOM_PIXMAP {
+            Ok(None)
+        } else {
+            let id = match property.format() {
+                32 => property.value::<u32>()[0],
+                8 => u32::from_ne_bytes(property.value::<u8>().try_into().unwrap()),
+                _ => unreachable!(),
+                // TODO Rare instance of 16 bit is indeed reachable
+            };
+            Ok(Some(id))
+        }
+    }
 }
 
-fn copy_pixmap(
-    source: Pixmap,
-    target: Pixmap,
-    connection: &Connection,
-    gc: Gcontext,
-    width: u16,
-    height: u16,
-) -> Result<()> {
-    let get_image_request = GetImage {
-        x: 0,
-        y: 0,
-        width,
-        height,
-        format: xcb::x::ImageFormat::ZPixmap,
-        drawable: Drawable::Pixmap(source),
-        plane_mask: !0,
-    };
-
-    let get_image_response = connection.send_request(&get_image_request);
-    let image_data = connection.wait_for_reply(get_image_response)?;
-
-    let get_image_request = PutImage {
-        dst_x: 0,
-        dst_y: 0,
-        width,
-        height,
-        left_pad: 0,
-        format: xcb::x::ImageFormat::ZPixmap,
-        drawable: Drawable::Pixmap(target),
-        depth: image_data.depth(),
-        data: image_data.data(),
-        gc,
-    };
-
-    connection
-        .send_and_check_request(&get_image_request)
-        .map_err(xcb::Error::from)?;
-
-    Ok(())
-}
 fn inner_load(open_method: OpenMethod) -> Result<BackgroundHandle> {
+    info!("Connecting to the Xorg Server");
     let (connection, screen_number) = Connection::connect(None).map_err(xcb::Error::from)?;
 
     let screen = connection
         .get_setup()
         .roots()
         .nth(screen_number as usize)
-        .ok_or(ShadeError::NoScreenFound)?;
+        .ok_or(Error::NoScreenFound)?;
 
-    let root = screen.root();
+    let window = screen.root();
     let width = screen.width_in_pixels();
     let height = screen.height_in_pixels();
 
+    // This is paradoxically almost always the same
     let shade_pmap = {
         let pid = connection.generate_id();
         let request = CreatePixmap {
@@ -147,7 +109,7 @@ fn inner_load(open_method: OpenMethod) -> Result<BackgroundHandle> {
             pid,
             width,
             height,
-            drawable: Drawable::Window(root),
+            drawable: Drawable::Window(window),
         };
 
         connection
@@ -156,6 +118,8 @@ fn inner_load(open_method: OpenMethod) -> Result<BackgroundHandle> {
 
         pid
     };
+
+    info!("Allocated shade pixmap with id {:?}", shade_pmap);
 
     let gc = {
         let cid = connection.generate_id();
@@ -168,60 +132,114 @@ fn inner_load(open_method: OpenMethod) -> Result<BackgroundHandle> {
         cid
     };
 
-    let xrootpmap = pixmap_from_atom(&connection, "_XROOTPMAP_ID", root)?;
-    let esetroot_pmap = pixmap_from_atom(&connection, "ESETROOT_PMAP_ID", root)?;
-    let pmap = xrootpmap.pmap.or(esetroot_pmap.pmap);
+    let mut atom_xrootpmap = {
+        let cookie = connection.send_request(&InternAtom {
+            name: b"_XROOTPMAP_ID",
+            only_if_exists: true,
+        });
 
-    if pmap.is_some() {
-        let pmap_id = pmap.unwrap();
+        connection.wait_for_reply(cookie)?.atom()
+    };
 
-        if let OpenMethod::KeepExisting = open_method {
-            copy_pixmap(pmap_id, shade_pmap, &connection, gc, width, height)?;
+    let mut atom_esetroot_pmap = {
+        let cookie = connection.send_request(&InternAtom {
+            name: b"ESETROOT_PMAP_ID",
+            only_if_exists: true,
+        });
+
+        connection.wait_for_reply(cookie)?.atom()
+    };
+
+    // Resolve the ids of the current pixmaps. If anyone is currently drawing to our beloved
+    // screen...
+    let xrootid = resolve_atom(&connection, window, atom_xrootpmap)?;
+    let esetrootid = resolve_atom(&connection, window, atom_esetroot_pmap)?;
+
+    info!("Foreign pixmaps are X: {xrootid:?} | E: {esetrootid:?}");
+
+    // ... we politely kill them
+    match (xrootid, esetrootid) {
+        (Some(x), Some(e)) => {
+            if x == e {
+                connection
+                    .send_and_check_request(&KillClient { resource: x })
+                    .map_err(xcb::Error::from)?;
+            } else {
+                connection
+                    .send_and_check_request(&KillClient { resource: x })
+                    .map_err(xcb::Error::from)?;
+                connection
+                    .send_and_check_request(&KillClient { resource: e })
+                    .map_err(xcb::Error::from)?;
+            }
+        }
+        (Some(x), None) => {
+            connection
+                .send_and_check_request(&KillClient { resource: x })
+                .map_err(xcb::Error::from)?;
         }
 
-        let kill_request = KillClient {
-            resource: pmap_id.resource_id(),
-        };
+        (None, Some(e)) => {
+            connection
+                .send_and_check_request(&KillClient { resource: e })
+                .map_err(xcb::Error::from)?;
+        }
 
-        connection
-            .send_and_check_request(&kill_request)
-            .map_err(xcb::Error::from)?;
-    }
+        (None, None) => {}
+    };
 
-    if let OpenMethod::LoadFromFile(_method, _path) = open_method {
-        todo!("Loading from file is not supported yet");
-        // let path = path.as_ref();
-        // let data = ImageReader::open(path)?.decode()?;
+    atom_xrootpmap = {
+        let cookie = connection.send_request(&InternAtom {
+            name: b"_XROOTPMAP_ID",
+            only_if_exists: false,
+        });
+
+        connection.wait_for_reply(cookie)?.atom()
+    };
+
+    atom_esetroot_pmap = {
+        let cookie = connection.send_request(&InternAtom {
+            name: b"ESETROOT_PMAP_ID",
+            only_if_exists: false,
+        });
+
+        connection.wait_for_reply(cookie)?.atom()
+    };
+
+    if atom_xrootpmap == ATOM_NONE || atom_esetroot_pmap == ATOM_NONE {
+        return Err(Error::RescreenFailure);
     }
 
     connection
         .send_and_check_request(&ChangeProperty {
-            mode: PropMode::Replace,
-            window: root,
-            property: xrootpmap.atom,
+            property: atom_xrootpmap,
+            mode: xcb::x::PropMode::Replace,
             r#type: ATOM_PIXMAP,
+            window,
             data: &[shade_pmap.resource_id()],
         })
         .map_err(xcb::Error::from)?;
 
     connection
         .send_and_check_request(&ChangeProperty {
-            mode: PropMode::Replace,
-            window: root,
-            property: esetroot_pmap.atom,
+            property: atom_esetroot_pmap,
+            mode: xcb::x::PropMode::Replace,
             r#type: ATOM_PIXMAP,
+            window,
             data: &[shade_pmap.resource_id()],
         })
         .map_err(xcb::Error::from)?;
 
+    // TODO This might not work on multi monitors
+    // TODO This also requires the monitor to be cleared
+    connection.send_request(&ChangeWindowAttributes {
+        window,
+        value_list: &[Cw::BackPixmap(shade_pmap)],
+    });
+
     connection
-        .send_and_check_request(&ClearArea {
-            window: root,
-            x: 0,
-            y: 0,
-            width: screen.width_in_pixels(),
-            height: screen.height_in_pixels(),
-            exposures: true,
+        .send_and_check_request(&SetCloseDownMode {
+            mode: RetainPermanent,
         })
         .map_err(xcb::Error::from)?;
 
@@ -231,7 +249,7 @@ fn inner_load(open_method: OpenMethod) -> Result<BackgroundHandle> {
         connection,
         width,
         height,
-        root,
+        root: window,
         buffer: RwLock::new(vec![0; height as usize * width as usize].into_boxed_slice()),
         background_pixmap: shade_pmap,
         context: gc,
@@ -244,3 +262,4 @@ pub fn load(options: OpenMethod) -> Result<&'static BackgroundHandle> {
     static HANDLE: OnceCell<BackgroundHandle> = OnceCell::new();
     HANDLE.get_or_try_init(|| inner_load(options))
 }
+

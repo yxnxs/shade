@@ -6,11 +6,9 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-bytes = "1.5.0"
 image = "0.24.7"
-num = "0.4.1"
 once_cell = "1.18.0"
 thiserror = "1.0.48"
 tracing = "0.1.37"
-tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
-xcb = { version = "1.2.2", features = ["debug_atom_names"] }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter"] } # Testing purposes
+xcb = "1.2.2"
