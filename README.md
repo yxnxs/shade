@@ -25,6 +25,11 @@ todo!()
 
 Will be uploaded to docs.rs once the project is ready
 
+## TODO
+
+- Support machines without a compositor 
+- Support machines with multiple monitors
+
 ## Inspiration and Acknowledgements
 - [conky](https://github.com/brndnmtthws/conky/) for the original idea
 - [feh](https://github.com/derf/feh) for a huge amount of guidance and serving as a reference
