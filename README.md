@@ -1,4 +1,4 @@
-**⚠️ WIP ⚠️**
+**⚠️ ~WIP~ Archived, development might continue later ⚠️**
 
 # Shade
 
